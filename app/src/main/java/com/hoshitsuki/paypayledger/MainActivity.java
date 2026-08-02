@@ -5,6 +5,8 @@ import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.DialogInterface;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Typeface;
@@ -39,6 +41,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
+import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -52,19 +55,15 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import jxl.Workbook;
-import jxl.write.Label;
-import jxl.write.Number;
-import jxl.write.WritableSheet;
-import jxl.write.WritableWorkbook;
-
 public class MainActivity extends Activity {
+    private static final int MAX_TEXT_IMPORT_BYTES = 10 * 1024 * 1024;
     private static final int REQUEST_IMAGES = 41;
     private static final int REQUEST_SAVE_BILLS = 42;
     private static final int REQUEST_IMPORT_CONFIG = 43;
     private static final int REQUEST_SAVE_CONFIG = 44;
     private static final int REQUEST_IMPORT_RULE_GROUPS = 45;
     private static final int REQUEST_SAVE_RULE_GROUPS = 46;
+    private static final int REQUEST_PAYPAY_CSV = 47;
     private static final String MIME_EXCEL = "application/vnd.ms-excel";
     private static final String MIME_CSV = "text/csv";
 
@@ -86,6 +85,7 @@ public class MainActivity extends Activity {
     private TextView countText;
     private ProgressBar progressBar;
     private Button importButton;
+    private Button csvImportButton;
     private Button yimuExportButton;
     private Button exportButton;
     private int processedCount = 0;
@@ -123,7 +123,7 @@ public class MainActivity extends Activity {
 
         root.addView(text("PayPay 自动记账", 30, ink, true));
 
-        TextView subtitle = text("从 PayPay 使用记录截图中提取账单，并按你的分类映射导出一木记账表。", 15, muted, false);
+        TextView subtitle = text("导入 PayPay 交易履历 CSV 或截图，自动分类并导出一木记账表。", 15, muted, false);
         subtitle.setPadding(0, dp(8), 0, dp(18));
         root.addView(subtitle);
 
@@ -139,20 +139,32 @@ public class MainActivity extends Activity {
         logo.setPadding(dp(8), dp(8), dp(8), dp(8));
         hero.addView(logo, new LinearLayout.LayoutParams(dp(82), dp(82)));
 
-        TextView heroTitle = text("导入截图", 24, ink, true);
+        TextView heroTitle = text("导入 PayPay 账单", 24, ink, true);
         heroTitle.setGravity(Gravity.CENTER);
         heroTitle.setPadding(0, dp(20), 0, dp(4));
         hero.addView(heroTitle);
 
-        TextView heroSub = text("可一次选择多张，重叠截图会自动去重。", 14, muted, false);
+        TextView heroSub = text("推荐使用官方 CSV；截图支持多选和自动去重。", 14, muted, false);
         heroSub.setGravity(Gravity.CENTER);
         hero.addView(heroSub);
 
-        importButton = actionButton("选择 PayPay 截图", sage, Color.WHITE, 18);
+        csvImportButton = actionButton("导入 PayPay CSV", sage, Color.WHITE, 18);
         LinearLayout.LayoutParams importLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(62));
         importLp.setMargins(0, dp(22), 0, 0);
-        hero.addView(importButton, importLp);
+        hero.addView(csvImportButton, importLp);
+        csvImportButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                openCsvPicker(REQUEST_PAYPAY_CSV);
+            }
+        });
+
+        importButton = actionButton("选择 PayPay 截图", sand, ink, 16);
+        LinearLayout.LayoutParams imageImportLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(52));
+        imageImportLp.setMargins(0, dp(10), 0, 0);
+        hero.addView(importButton, imageImportLp);
         importButton.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -188,7 +200,7 @@ public class MainActivity extends Activity {
         progressLp.setMargins(0, dp(16), 0, 0);
         root.addView(progressBar, progressLp);
 
-        statusText = text("等待导入截图", 14, muted, false);
+        statusText = text("等待导入 PayPay CSV 或截图", 14, muted, false);
         statusText.setPadding(0, dp(12), 0, dp(16));
         root.addView(statusText);
 
@@ -493,6 +505,10 @@ public class MainActivity extends Activity {
             handleImageSelection(data);
             return;
         }
+        if (requestCode == REQUEST_PAYPAY_CSV) {
+            handlePayPayCsvImport(data.getData());
+            return;
+        }
         if (requestCode == REQUEST_SAVE_BILLS) {
             handleCustomExport(data.getData());
             return;
@@ -550,6 +566,55 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void handlePayPayCsvImport(Uri uri) {
+        if (uri == null) {
+            return;
+        }
+        try {
+            PayPayCsvParser.Result result = PayPayCsvParser.parse(readText(uri));
+            bills.clear();
+            seenKeys.clear();
+            for (PayPayCsvParser.Record record : result.records) {
+                CategoryRuleStore.CategoryResult category = rules.classify(record.merchant);
+                BillItem item = new BillItem(
+                        record.merchant,
+                        record.date,
+                        record.time,
+                        record.amount,
+                        record.transactionId,
+                        category);
+                if (seenKeys.add(item.key())) {
+                    bills.add(item);
+                }
+            }
+            finishImportedBills();
+            String summary = "已导入 " + bills.size() + " 条卡片／信用支付账单";
+            if (result.ignoredNonExpense > 0 || result.invalid > 0) {
+                summary += "，跳过 " + (result.ignoredNonExpense + result.invalid) + " 条无有效支出的记录";
+            }
+            statusText.setText(summary);
+            Toast.makeText(this, summary, Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            statusText.setText("PayPay CSV 导入失败：" + e.getMessage());
+            Toast.makeText(this, "PayPay CSV 导入失败：" + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void finishImportedBills() {
+        Collections.sort(bills, new Comparator<BillItem>() {
+            @Override
+            public int compare(BillItem a, BillItem b) {
+                return (a.date + " " + a.time).compareTo(b.date + " " + b.time);
+            }
+        });
+        progressBar.setProgress(100);
+        renderBills();
+        countText.setText(bills.size() + "\n已识别账单");
+        boolean hasBills = !bills.isEmpty();
+        yimuExportButton.setEnabled(hasBills);
+        exportButton.setEnabled(hasBills);
+    }
+
     private void processImages() {
         bills.clear();
         seenKeys.clear();
@@ -558,6 +623,7 @@ public class MainActivity extends Activity {
         yimuExportButton.setEnabled(false);
         exportButton.setEnabled(false);
         importButton.setEnabled(false);
+        csvImportButton.setEnabled(false);
         statusText.setText("正在识别 0/" + pendingUris.size());
         progressBar.setProgress(0);
         processNextImage();
@@ -569,35 +635,138 @@ public class MainActivity extends Activity {
             return;
         }
         final Uri uri = pendingUris.get(processedCount);
+        final ArrayList<BillItem> parsedBills = new ArrayList<BillItem>();
+        final Runnable completeImage = new Runnable() {
+            @Override
+            public void run() {
+                addParsedBills(parsedBills);
+                processedCount++;
+                int progress = pendingUris.isEmpty() ? 0 : (processedCount * 100 / pendingUris.size());
+                progressBar.setProgress(progress);
+                statusText.setText("正在识别 " + processedCount + "/" + pendingUris.size());
+                processNextImage();
+            }
+        };
         try {
             final InputImage image = InputImage.fromFilePath(this, uri);
             recognizer.process(image)
                     .addOnSuccessListener(new com.google.android.gms.tasks.OnSuccessListener<Text>() {
                         @Override
                         public void onSuccess(Text text) {
-                            addParsedBills(parsePayPayText(text, image.getWidth()));
+                            parsedBills.addAll(parsePayPayText(text, image.getWidth(), image.getHeight()));
                         }
                     })
                     .addOnFailureListener(new com.google.android.gms.tasks.OnFailureListener() {
                         @Override
                         public void onFailure(Exception e) {
-                            Toast.makeText(MainActivity.this, "有一张截图识别失败", Toast.LENGTH_SHORT).show();
+                            Toast.makeText(MainActivity.this, "整图识别失败，正在尝试分区识别", Toast.LENGTH_SHORT).show();
                         }
                     })
                     .addOnCompleteListener(new com.google.android.gms.tasks.OnCompleteListener<Text>() {
                         @Override
                         public void onComplete(com.google.android.gms.tasks.Task<Text> task) {
-                            processedCount++;
-                            int progress = pendingUris.isEmpty() ? 0 : (processedCount * 100 / pendingUris.size());
-                            progressBar.setProgress(progress);
-                            statusText.setText("正在识别 " + processedCount + "/" + pendingUris.size());
-                            processNextImage();
+                            processCroppedPasses(uri, parsedBills, completeImage);
                         }
                     });
         } catch (IOException e) {
-            processedCount++;
-            processNextImage();
+            completeImage.run();
         }
+    }
+
+    private void processCroppedPasses(Uri uri, final List<BillItem> parsedBills, Runnable completion) {
+        try {
+            Bitmap source = loadOcrBitmap(uri, 2200);
+            if (source == null || source.getWidth() < 200 || source.getHeight() < 400) {
+                if (source != null) {
+                    source.recycle();
+                }
+                completion.run();
+                return;
+            }
+            processCroppedPass(source, 0, parsedBills, completion);
+        } catch (Exception ignored) {
+            completion.run();
+        }
+    }
+
+    private Bitmap loadOcrBitmap(Uri uri, int maxDimension) throws IOException {
+        BitmapFactory.Options bounds = new BitmapFactory.Options();
+        bounds.inJustDecodeBounds = true;
+        InputStream boundsStream = getContentResolver().openInputStream(uri);
+        if (boundsStream == null) {
+            throw new IOException("无法读取截图");
+        }
+        try {
+            BitmapFactory.decodeStream(boundsStream, null, bounds);
+        } finally {
+            boundsStream.close();
+        }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            throw new IOException("截图格式无法解码");
+        }
+
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inSampleSize = 1;
+        int largest = Math.max(bounds.outWidth, bounds.outHeight);
+        while (largest / (options.inSampleSize * 2) >= maxDimension) {
+            options.inSampleSize *= 2;
+        }
+        InputStream imageStream = getContentResolver().openInputStream(uri);
+        if (imageStream == null) {
+            throw new IOException("无法读取截图");
+        }
+        try {
+            Bitmap bitmap = BitmapFactory.decodeStream(imageStream, null, options);
+            if (bitmap == null) {
+                throw new IOException("截图格式无法解码");
+            }
+            return bitmap;
+        } finally {
+            imageStream.close();
+        }
+    }
+
+    private void processCroppedPass(
+            final Bitmap source,
+            final int pass,
+            final List<BillItem> parsedBills,
+            final Runnable completion) {
+        final float[][] ranges = new float[][]{
+                {0.14f, 0.53f},
+                {0.40f, 0.79f},
+                {0.66f, 0.99f}
+        };
+        if (pass >= ranges.length) {
+            source.recycle();
+            completion.run();
+            return;
+        }
+
+        int left = Math.max(0, Math.round(source.getWidth() * 0.08f));
+        int right = Math.min(source.getWidth(), Math.round(source.getWidth() * 0.995f));
+        int top = Math.max(0, Math.round(source.getHeight() * ranges[pass][0]));
+        int bottom = Math.min(source.getHeight(), Math.round(source.getHeight() * ranges[pass][1]));
+        if (right <= left || bottom <= top) {
+            processCroppedPass(source, pass + 1, parsedBills, completion);
+            return;
+        }
+
+        final Bitmap crop = Bitmap.createBitmap(source, left, top, right - left, bottom - top);
+        final InputImage cropImage = InputImage.fromBitmap(crop, 0);
+        recognizer.process(cropImage)
+                .addOnSuccessListener(new com.google.android.gms.tasks.OnSuccessListener<Text>() {
+                    @Override
+                    public void onSuccess(Text text) {
+                        parsedBills.addAll(parsePayPayText(text, crop.getWidth(), crop.getHeight()));
+                    }
+                })
+                .addOnCompleteListener(new com.google.android.gms.tasks.OnCompleteListener<Text>() {
+                    @Override
+                    public void onComplete(com.google.android.gms.tasks.Task<Text> task) {
+                        crop.recycle();
+                        processCroppedPass(source, pass + 1, parsedBills, completion);
+                    }
+                });
     }
 
     private void addParsedBills(List<BillItem> parsed) {
@@ -635,59 +804,11 @@ public class MainActivity extends Activity {
     }
 
     private boolean isLikelySameMerchant(String left, String right) {
-        String a = dedupeMerchant(left);
-        String b = dedupeMerchant(right);
-        if (a.length() == 0 || b.length() == 0) {
-            return false;
-        }
-        if (a.equals(b) || a.contains(b) || b.contains(a)) {
-            return true;
-        }
-        if (sharedPrefixLength(a, b) >= 5) {
-            return true;
-        }
-        return similarity(a, b) >= 0.72f;
+        return MerchantDeduplicator.isLikelySame(left, right);
     }
 
     private String dedupeMerchant(String value) {
-        return CategoryRuleStore.normalizeMerchant(value)
-                .replaceAll("\\s+", "")
-                .replaceAll("[^a-z0-9\\p{IsHan}\\p{IsHiragana}\\p{IsKatakana}]+", "");
-    }
-
-    private int sharedPrefixLength(String a, String b) {
-        int max = Math.min(a.length(), b.length());
-        int count = 0;
-        while (count < max && a.charAt(count) == b.charAt(count)) {
-            count++;
-        }
-        return count;
-    }
-
-    private float similarity(String a, String b) {
-        int common = longestCommonSubsequence(a, b);
-        return (2.0f * common) / (a.length() + b.length());
-    }
-
-    private int longestCommonSubsequence(String a, String b) {
-        int[] previous = new int[b.length() + 1];
-        int[] current = new int[b.length() + 1];
-        for (int i = 1; i <= a.length(); i++) {
-            for (int j = 1; j <= b.length(); j++) {
-                if (a.charAt(i - 1) == b.charAt(j - 1)) {
-                    current[j] = previous[j - 1] + 1;
-                } else {
-                    current[j] = Math.max(previous[j], current[j - 1]);
-                }
-            }
-            int[] tmp = previous;
-            previous = current;
-            current = tmp;
-            for (int j = 0; j < current.length; j++) {
-                current[j] = 0;
-            }
-        }
-        return previous[b.length()];
+        return MerchantDeduplicator.normalize(value);
     }
 
     private int merchantCompletenessScore(String merchant) {
@@ -696,6 +817,7 @@ public class MainActivity extends Activity {
 
     private void finishProcessing() {
         importButton.setEnabled(true);
+        csvImportButton.setEnabled(true);
         Collections.sort(bills, new Comparator<BillItem>() {
             @Override
             public int compare(BillItem a, BillItem b) {
@@ -714,7 +836,7 @@ public class MainActivity extends Activity {
         prepareTempExportAndPrompt();
     }
 
-    private List<BillItem> parsePayPayText(Text text, int imageWidth) {
+    private List<BillItem> parsePayPayText(Text text, int imageWidth, int imageHeight) {
         ArrayList<LineItem> lines = new ArrayList<LineItem>();
         for (Text.TextBlock block : text.getTextBlocks()) {
             for (Text.Line line : block.getLines()) {
@@ -741,7 +863,7 @@ public class MainActivity extends Activity {
             if (amount == null || amountLine.centerX() < imageWidth * 0.42f) {
                 continue;
             }
-            LineItem dateLine = findDateLine(lines, amountLine, imageWidth);
+            LineItem dateLine = findDateLine(lines, amountLine, imageWidth, imageHeight);
             if (dateLine == null) {
                 continue;
             }
@@ -749,9 +871,9 @@ public class MainActivity extends Activity {
             if (dateTime == null) {
                 continue;
             }
-            String merchant = findMerchant(lines, amountLine, dateLine, imageWidth);
+            String merchant = findMerchant(lines, amountLine, dateLine, imageWidth, imageHeight);
             if (merchant.length() == 0) {
-                merchant = clean(amountLine.text.replaceAll("[0-9０-９,，]+\\s*円", ""));
+                merchant = removeAmount(amountLine.text);
             }
             if (merchant.length() == 0 || isNoise(merchant)) {
                 continue;
@@ -762,31 +884,65 @@ public class MainActivity extends Activity {
         return result;
     }
 
-    private LineItem findDateLine(List<LineItem> lines, LineItem amountLine, int imageWidth) {
+    private LineItem findDateLine(List<LineItem> lines, LineItem amountLine, int imageWidth, int imageHeight) {
         LineItem best = null;
         int bestScore = Integer.MAX_VALUE;
         for (LineItem line : lines) {
             if (line.centerX() > imageWidth * 0.82f) {
                 continue;
             }
-            if (extractDateTime(line.text) == null) {
+            LineItem candidate = line;
+            if (extractDateTime(candidate.text) == null) {
+                candidate = combineDateAndTimeLine(lines, line, imageWidth);
+                if (candidate == null) {
+                    continue;
+                }
+            }
+            int maxDistance = Math.max(210, imageHeight / 9);
+            int dy = Math.abs(candidate.centerY() - amountLine.centerY());
+            if (dy > maxDistance || candidate.centerY() < amountLine.centerY() - Math.max(30, amountLine.box.height())) {
                 continue;
             }
-            int dy = Math.abs(line.centerY() - amountLine.centerY());
-            if (dy > 210 || line.centerY() < amountLine.centerY() - 30) {
-                continue;
-            }
-            int score = dy + Math.abs(line.box.left - amountLine.box.left) / 6;
+            int score = dy + Math.abs(candidate.box.left - amountLine.box.left) / 6;
             if (score < bestScore) {
-                best = line;
+                best = candidate;
                 bestScore = score;
             }
         }
         return best;
     }
 
-    private String findMerchant(List<LineItem> lines, LineItem amountLine, LineItem dateLine, int imageWidth) {
+    private LineItem combineDateAndTimeLine(List<LineItem> lines, LineItem first, int imageWidth) {
+        for (LineItem second : lines) {
+            if (second == first || second.centerX() > imageWidth * 0.82f) {
+                continue;
+            }
+            int verticalGap = Math.max(0,
+                    Math.max(first.box.top, second.box.top) - Math.min(first.box.bottom, second.box.bottom));
+            int allowedGap = Math.max(55, Math.max(first.box.height(), second.box.height()) * 2);
+            if (verticalGap > allowedGap || Math.abs(first.box.left - second.box.left) > imageWidth * 0.35f) {
+                continue;
+            }
+            LineItem upper = first.box.top <= second.box.top ? first : second;
+            LineItem lower = upper == first ? second : first;
+            String combinedText = upper.text + " " + lower.text;
+            if (extractDateTime(combinedText) != null) {
+                Rect box = new Rect(upper.box);
+                box.union(lower.box);
+                return new LineItem(combinedText, box);
+            }
+        }
+        return null;
+    }
+
+    private String findMerchant(
+            List<LineItem> lines,
+            LineItem amountLine,
+            LineItem dateLine,
+            int imageWidth,
+            int imageHeight) {
         ArrayList<LineItem> candidates = new ArrayList<LineItem>();
+        int merchantBand = Math.max(110, imageHeight / 18);
         for (LineItem line : lines) {
             if (line.centerX() > imageWidth * 0.78f) {
                 continue;
@@ -794,11 +950,12 @@ public class MainActivity extends Activity {
             if (line.box.left < imageWidth * 0.14f) {
                 continue;
             }
-            if (line.box.top < amountLine.box.top - 110 || line.box.top > dateLine.box.top - 2) {
+            if (line.box.top < amountLine.box.top - merchantBand || line.box.top > dateLine.box.top - 2) {
                 continue;
             }
             if (line == amountLine || line == dateLine || isNoise(line.text)
-                    || extractAmount(line.text) != null || extractDateTime(line.text) != null) {
+                    || extractAmount(line.text) != null || extractDateTime(line.text) != null
+                    || isDateTimeFragment(line.text)) {
                 continue;
             }
             candidates.add(line);
@@ -823,7 +980,8 @@ public class MainActivity extends Activity {
             if (used >= 3) {
                 break;
             }
-            if (lastBottom > 0 && candidate.box.top - lastBottom > 48) {
+            int allowedGap = Math.max(48, candidate.box.height() * 2);
+            if (lastBottom > 0 && candidate.box.top - lastBottom > allowedGap) {
                 break;
             }
             if (merchant.length() > 0) {
@@ -837,7 +995,7 @@ public class MainActivity extends Activity {
     }
 
     private String removeAmount(String text) {
-        return clean(text.replaceAll("[0-9０-９][0-9０-９,，]*\\s*円", ""));
+        return clean(text.replaceAll("[0-9０-９Oo〇○][0-9０-９Oo〇○,，.．\\s]*\\s*[円¥￥]", ""));
     }
 
     private String polishMerchantName(String value) {
@@ -849,31 +1007,19 @@ public class MainActivity extends Activity {
     }
 
     private Integer extractAmount(String text) {
-        Matcher matcher = Pattern.compile("([0-9０-９][0-9０-９,，]*)\\s*円").matcher(normalize(text));
-        if (!matcher.find()) {
-            return null;
-        }
-        try {
-            return Integer.parseInt(matcher.group(1).replace(",", "").replace("，", ""));
-        } catch (NumberFormatException e) {
-            return null;
-        }
+        return OcrTextParser.extractAmount(text);
     }
 
     private String[] extractDateTime(String text) {
-        Matcher matcher = Pattern.compile("(20[0-9]{2})年([0-9]{1,2})月([0-9]{1,2})日\\s*([0-9]{1,2})時([0-9]{1,2})分")
-                .matcher(normalize(text));
-        if (!matcher.find()) {
-            return null;
-        }
-        String date = String.format(Locale.US, "%04d-%02d-%02d",
-                Integer.parseInt(matcher.group(1)),
-                Integer.parseInt(matcher.group(2)),
-                Integer.parseInt(matcher.group(3)));
-        String time = String.format(Locale.US, "%02d:%02d",
-                Integer.parseInt(matcher.group(4)),
-                Integer.parseInt(matcher.group(5)));
-        return new String[]{date, time};
+        OcrTextParser.DateTime result = OcrTextParser.extractDateTime(text);
+        return result == null ? null : new String[]{result.date, result.time};
+    }
+
+    private boolean isDateTimeFragment(String text) {
+        String value = Normalizer.normalize(text == null ? "" : text, Normalizer.Form.NFKC);
+        return value.matches(".*20[0-9Oo〇○]{2}\\s*年.*")
+                || value.matches(".*[0-9Oo〇○]{1,2}\\s*月\\s*[0-9Oo〇○]{1,2}\\s*日.*")
+                || value.matches(".*[0-9Oo〇○]{1,2}\\s*(?:時|峙|:)\\s*[0-9Oo〇○]{1,2}\\s*分?.*");
     }
 
     private String clean(String text) {
@@ -938,7 +1084,7 @@ public class MainActivity extends Activity {
             top.addView(name, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
             TextView amount = text(String.format(Locale.US, "%,d円", bill.amount), 18, ink, true);
-            amount.setGravity(Gravity.RIGHT);
+        amount.setGravity(Gravity.END);
             top.addView(amount);
 
             String minor = bill.minor.length() == 0 ? "无二级分类" : bill.minor;
@@ -1223,8 +1369,11 @@ public class MainActivity extends Activity {
     private File writeTempWorkbook() throws Exception {
         File output = new File(getCacheDir(), "paypay_yimu_latest.xls");
         FileOutputStream outputStream = new FileOutputStream(output, false);
-        outputStream.write(XlsExporter.create(bills));
-        outputStream.close();
+        try {
+            outputStream.write(XlsExporter.create(bills));
+        } finally {
+            outputStream.close();
+        }
         return output;
     }
 
@@ -1365,8 +1514,11 @@ public class MainActivity extends Activity {
         if (outputStream == null) {
             throw new IOException("无法写入文件");
         }
-        outputStream.write(data);
-        outputStream.close();
+        try {
+            outputStream.write(data);
+        } finally {
+            outputStream.close();
+        }
     }
 
     private String readText(Uri uri) throws IOException {
@@ -1374,14 +1526,20 @@ public class MainActivity extends Activity {
         if (inputStream == null) {
             throw new IOException("无法读取文件");
         }
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        byte[] buffer = new byte[4096];
-        int read;
-        while ((read = inputStream.read(buffer)) != -1) {
-            bytes.write(buffer, 0, read);
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            int read;
+            while ((read = inputStream.read(buffer)) != -1) {
+                bytes.write(buffer, 0, read);
+                if (bytes.size() > MAX_TEXT_IMPORT_BYTES) {
+                    throw new IOException("导入文件超过 10 MB");
+                }
+            }
+            return bytes.toString("UTF-8");
+        } finally {
+            inputStream.close();
         }
-        inputStream.close();
-        return bytes.toString("UTF-8");
     }
 
     private String joinKeywords(Set<String> values) {
@@ -1507,11 +1665,18 @@ public class MainActivity extends Activity {
         String groupId;
         String categorySource;
 
+        final String sourceId;
+
         BillItem(String merchant, String date, String time, int amount, CategoryRuleStore.CategoryResult category) {
+            this(merchant, date, time, amount, "", category);
+        }
+
+        BillItem(String merchant, String date, String time, int amount, String sourceId, CategoryRuleStore.CategoryResult category) {
             this.merchant = merchant;
             this.date = date;
             this.time = time;
             this.amount = amount;
+            this.sourceId = sourceId == null ? "" : sourceId.trim();
             applyCategory(category);
         }
 
@@ -1523,36 +1688,26 @@ public class MainActivity extends Activity {
         }
 
         String key() {
-            return merchant + "|" + date + "|" + time + "|" + amount;
+            return sourceId.length() > 0
+                    ? "paypay|" + sourceId
+                    : merchant + "|" + date + "|" + time + "|" + amount;
         }
     }
 
     private static class XlsExporter {
         static byte[] create(List<BillItem> bills) throws Exception {
-            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-            WritableWorkbook workbook = Workbook.createWorkbook(bytes);
-            WritableSheet sheet = workbook.createSheet("Sheet1", 0);
-            String[] headers = new String[]{"日期", "收支类型", "金额", "类别", "二级分类", "所属账本", "收支账户", "备注", "标签", "地址"};
-            for (int i = 0; i < headers.length; i++) {
-                sheet.addCell(new Label(i, 0, headers[i]));
+            ArrayList<YimuXlsExporter.Entry> entries =
+                    new ArrayList<YimuXlsExporter.Entry>();
+            for (BillItem bill : bills) {
+                entries.add(new YimuXlsExporter.Entry(
+                        bill.merchant,
+                        bill.date,
+                        bill.time,
+                        bill.amount,
+                        bill.major,
+                        bill.minor));
             }
-            for (int i = 0; i < bills.size(); i++) {
-                BillItem bill = bills.get(i);
-                int row = i + 1;
-                sheet.addCell(new Label(0, row, bill.date + " " + bill.time));
-                sheet.addCell(new Label(1, row, "支出"));
-                sheet.addCell(new Number(2, row, bill.amount));
-                sheet.addCell(new Label(3, row, bill.major));
-                sheet.addCell(new Label(4, row, bill.minor));
-                sheet.addCell(new Label(5, row, "日常账本"));
-                sheet.addCell(new Label(6, row, "PayPay"));
-                sheet.addCell(new Label(7, row, bill.merchant));
-                sheet.addCell(new Label(8, row, ""));
-                sheet.addCell(new Label(9, row, ""));
-            }
-            workbook.write();
-            workbook.close();
-            return bytes.toByteArray();
+            return YimuXlsExporter.create(entries);
         }
     }
 }

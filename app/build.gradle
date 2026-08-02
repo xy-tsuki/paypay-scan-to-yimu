@@ -16,8 +16,8 @@ android {
         applicationId "com.hoshitsuki.paypayledger"
         minSdk 23
         targetSdk 33
-        versionCode 4
-        versionName "1.1.0"
+        versionCode 5
+        versionName "1.1.1"
     }
 
     compileOptions {
@@ -38,7 +38,9 @@ android {
 
     buildTypes {
         release {
-            signingConfig keystorePropertiesFile.exists() ? signingConfigs.release : signingConfigs.debug
+            if (keystorePropertiesFile.exists()) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled false
         }
     }
@@ -48,4 +50,5 @@ dependencies {
     implementation "androidx.core:core:1.9.0"
     implementation "com.google.mlkit:text-recognition-japanese:16.0.1"
     implementation "net.sourceforge.jexcelapi:jxl:2.6.12"
+    testImplementation "junit:junit:4.13.2"
 }

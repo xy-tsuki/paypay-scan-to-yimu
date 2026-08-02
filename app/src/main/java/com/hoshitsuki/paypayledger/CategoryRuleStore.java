@@ -2,6 +2,7 @@ package com.hoshitsuki.paypayledger;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.util.Log;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -22,6 +23,7 @@ import java.util.Map;
 import java.util.Set;
 
 public class CategoryRuleStore {
+    private static final String TAG = "CategoryRuleStore";
     private static final String PREFS = "category_rules";
     private static final String KEY_MAPPINGS = "category_mapping_json";
     private static final String KEY_OVERRIDES = "merchant_override_json";
@@ -36,6 +38,7 @@ public class CategoryRuleStore {
         this.context = context.getApplicationContext();
         prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         buildBuiltInGroups();
+        migrateImportedGroupStorage();
     }
 
     public boolean hasUserMappings() {
@@ -245,23 +248,7 @@ public class CategoryRuleStore {
     }
 
     public RuleGroup matchRuleGroup(String merchant) {
-        String normalized = normalizeMerchant(merchant);
-        for (RuleGroup group : getEffectiveRuleGroups()) {
-            for (String keyword : group.keywords) {
-                String key = normalizeMerchant(keyword);
-                if (key.length() == 0) {
-                    continue;
-                }
-                if (key.length() <= 2) {
-                    if (normalized.equals(key) || normalized.startsWith(key + " ")) {
-                        return group;
-                    }
-                } else if (normalized.contains(key)) {
-                    return group;
-                }
-            }
-        }
-        return null;
+        return MerchantRuleMatcher.match(getEffectiveRuleGroups(), merchant);
     }
 
     public String importCategoryMappingsCsv(String csv) throws Exception {
@@ -504,21 +491,28 @@ public class CategoryRuleStore {
             JSONArray array = new JSONArray(raw);
             for (int i = 0; i < array.length(); i++) {
                 JSONObject item = array.getJSONObject(i);
-                RuleGroup group = new RuleGroup(migrateGroupId(item.optString("group_id")), item.optString("group_name"), 1000 + i, true);
-                JSONArray keywords = item.optJSONArray("keywords");
-                if (keywords != null) {
-                    for (int j = 0; j < keywords.length(); j++) {
-                        String keyword = keywords.optString(j);
-                        if (keyword.length() > 0) {
-                            group.keywords.add(keyword);
-                        }
+                String groupId = migrateGroupId(item.optString("group_id"));
+                RuleGroup builtIn = builtInGroups.get(groupId);
+                RuleGroup group = new RuleGroup(
+                        groupId,
+                        item.optString("group_name", builtIn == null ? "" : builtIn.groupName),
+                        builtIn == null ? 1000 + i : builtIn.order,
+                        true);
+                if (item.has("added_keywords") || item.has("removed_keywords")) {
+                    if (builtIn != null) {
+                        group.keywords.addAll(builtIn.keywords);
                     }
+                    removeJsonKeywords(group.keywords, item.optJSONArray("removed_keywords"));
+                    addJsonKeywords(group.keywords, item.optJSONArray("added_keywords"));
+                } else {
+                    addJsonKeywords(group.keywords, item.optJSONArray("keywords"));
                 }
                 if (group.groupId.length() > 0 && group.groupName.length() > 0) {
                     groups.put(group.groupId, group);
                 }
             }
-        } catch (JSONException ignored) {
+        } catch (JSONException e) {
+            Log.e(TAG, "无法读取商户识别规则", e);
         }
         return groups;
     }
@@ -530,18 +524,61 @@ public class CategoryRuleStore {
             try {
                 item.put("group_id", group.groupId);
                 item.put("group_name", group.groupName);
-                JSONArray keywords = new JSONArray();
-                ArrayList<String> sorted = new ArrayList<String>(group.keywords);
-                Collections.sort(sorted);
-                for (String keyword : sorted) {
-                    keywords.put(keyword);
+                RuleGroup builtIn = builtInGroups.get(group.groupId);
+                if (builtIn == null) {
+                    item.put("keywords", jsonKeywords(group.keywords));
+                } else {
+                    LinkedHashSet<String> added = new LinkedHashSet<String>(group.keywords);
+                    added.removeAll(builtIn.keywords);
+                    LinkedHashSet<String> removed = new LinkedHashSet<String>(builtIn.keywords);
+                    removed.removeAll(group.keywords);
+                    item.put("added_keywords", jsonKeywords(added));
+                    item.put("removed_keywords", jsonKeywords(removed));
                 }
-                item.put("keywords", keywords);
                 array.put(item);
-            } catch (JSONException ignored) {
+            } catch (JSONException e) {
+                Log.e(TAG, "无法保存商户识别规则", e);
             }
         }
         prefs.edit().putString(KEY_IMPORTED_GROUPS, array.toString()).apply();
+    }
+
+    private void migrateImportedGroupStorage() {
+        String raw = prefs.getString(KEY_IMPORTED_GROUPS, "");
+        if (raw.contains("\"keywords\"")) {
+            saveImportedGroups(new ArrayList<RuleGroup>(loadImportedGroups().values()));
+        }
+    }
+
+    private static void addJsonKeywords(Set<String> target, JSONArray values) {
+        if (values == null) {
+            return;
+        }
+        for (int i = 0; i < values.length(); i++) {
+            String keyword = values.optString(i).trim();
+            if (keyword.length() > 0) {
+                target.add(keyword);
+            }
+        }
+    }
+
+    private static void removeJsonKeywords(Set<String> target, JSONArray values) {
+        if (values == null) {
+            return;
+        }
+        for (int i = 0; i < values.length(); i++) {
+            target.remove(values.optString(i).trim());
+        }
+    }
+
+    private static JSONArray jsonKeywords(Set<String> keywords) {
+        JSONArray array = new JSONArray();
+        ArrayList<String> sorted = new ArrayList<String>(keywords);
+        Collections.sort(sorted);
+        for (String keyword : sorted) {
+            array.put(keyword);
+        }
+        return array;
     }
 
     private void saveOverrides(List<MerchantOverride> overrides) {
@@ -575,7 +612,8 @@ public class CategoryRuleStore {
                     addGroup(i - 1, groupId, groupName, keywords);
                 }
             }
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            Log.e(TAG, "无法加载内置商户识别规则", e);
         }
     }
 
@@ -595,14 +633,17 @@ public class CategoryRuleStore {
 
     private String readAssetText(String name) throws IOException {
         InputStream inputStream = context.getAssets().open(name);
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        byte[] buffer = new byte[4096];
-        int read;
-        while ((read = inputStream.read(buffer)) != -1) {
-            bytes.write(buffer, 0, read);
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            byte[] buffer = new byte[4096];
+            int read;
+            while ((read = inputStream.read(buffer)) != -1) {
+                bytes.write(buffer, 0, read);
+            }
+            return bytes.toString("UTF-8");
+        } finally {
+            inputStream.close();
         }
-        inputStream.close();
-        return bytes.toString("UTF-8");
     }
     private static void requireHeader(List<String[]> rows, String... expected) throws Exception {
         if (rows.isEmpty()) {
@@ -616,7 +657,7 @@ public class CategoryRuleStore {
         }
     }
 
-    private static List<String[]> parseCsv(String text) {
+    private static List<String[]> parseCsv(String text) throws Exception {
         ArrayList<String[]> rows = new ArrayList<String[]>();
         ArrayList<String> row = new ArrayList<String>();
         StringBuilder cell = new StringBuilder();
@@ -648,6 +689,9 @@ public class CategoryRuleStore {
             } else if (c != '\r') {
                 cell.append(c);
             }
+        }
+        if (quoted) {
+            throw new Exception("CSV 引号没有正确闭合");
         }
         row.add(cell.toString());
         boolean hasData = false;
